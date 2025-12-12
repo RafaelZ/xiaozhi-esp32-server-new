@@ -119,7 +119,36 @@ class AgentState(TypedDict):
     4.  更新 `user_profile` 存储。
 *   **难点**：多实例部署时的并发问题（需确保只有一个 Worker 执行总结）。如果是单机部署，简单的后台 Thread 即可。
 
-### 4.3 难点与对策
+### 4.3 性能挑战与优化：低延迟风险检测 (Latency Optimization)
+
+您指出的"串行执行导致延迟增加"是一个关键问题。在实时语音交互中，每一毫秒都很重要。为了解决这个问题，我们需要从**串行处理**转向**并行执行与门控（Parallel Execution & Gating）**模式。
+
+#### **优化架构：并行竞速模式 (Parallel Race Architecture)**
+
+我们不在 Graph 中简单地串行连接 `input_guard` 和 `agent`，而是利用 LangGraph 的并行分支能力。
+
+1.  **并行分支 (Fan-out)**：
+    *   当收到用户文本（ASR输出）后，Graph 同时启动两个分支：
+        *   **Branch A (Risk Guard)**: 调用快速的小模型（如微调过的 BERT 或 GPT-4o-mini）进行二分类（有风险/无风险）。预计耗时：**200ms**。
+        *   **Branch B (Main Agent)**: 调用主 LLM 生成回复。预计首字延迟 (TTFT)：**500ms - 800ms**。
+
+2.  **输出门控 (Output Gate / Merge Node)**：
+    *   创建一个 `GateNode` 接收两者的输出。
+    *   **逻辑**：
+        *   开始接收 Branch B (Agent) 的流式 Token，并将其**缓冲 (Buffer)** 在内存中，暂时不发送给 TTS。
+        *   一旦 Branch A (Risk Guard) 返回结果：
+            *   **情况 1：无风险 (Safe)** —— 立即释放缓冲区中的 Token 给 TTS，并建立直接流式通道。由于 Guard (200ms) 通常比 Agent TTFT (500ms) 快，用户**感觉不到任何额外延迟**。
+            *   **情况 2：高风险 (High Risk)** —— 丢弃缓冲区中的 Agent 回复，取消 Branch B 的任务。立即输出预设的或由 Guard 生成的干预话术（Intervention）。
+
+#### **模型选择策略**
+为了确保 Risk Guard 跑在 Main Agent 前面：
+*   **Risk Model**: 必须使用专用的低延迟模型。
+    *   *推荐*: 本地部署的 BERT/RoBERTa 情感分类模型 (CPU < 50ms) 或 云端 GPT-4o-mini (TPot < 300ms)。
+    *   *避免*: 不要使用与 Main Agent 相同的大参数量模型（如 GPT-4）。
+
+通过这种架构，我们将风险检测的耗时"隐藏"在了主模型生成的耗时之中，实现了**零感知延迟**的安全拦截。
+
+### 4.4 难点与对策
 
 1.  **流式输出适配 (Streaming Adapter)**：
     *   **问题**：LangChain 的 `astream_events` 输出的是 Token 或 Event 对象，而现有前端期待的是 WebSocket 音频流/文本流。
