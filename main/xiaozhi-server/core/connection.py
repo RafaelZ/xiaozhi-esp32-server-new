@@ -42,6 +42,12 @@ from core.utils.prompt_manager import PromptManager
 from core.utils.voiceprint_provider import VoiceprintProvider
 from core.utils import textUtils
 
+# LangGraph Integration
+from langchain_core.messages import HumanMessage
+from core.agent.graph import build_agent_graph
+from core.agent.tools.adapter import ToolAdapter
+from core.agent.memory.store import get_store, SummaryManager
+
 TAG = __name__
 
 auto_import_modules("plugins_func.functions")
@@ -163,6 +169,10 @@ class ConnectionHandler:
 
         # 初始化提示词管理器
         self.prompt_manager = PromptManager(self.config, self.logger)
+
+        # Initialize LangGraph Agent
+        self.agent_graph = None
+        self.tool_adapter = None
 
     async def handle_connection(self, ws):
         try:
@@ -754,16 +764,37 @@ class ConnectionHandler:
         if hasattr(self, "loop") and self.loop:
             asyncio.run_coroutine_threadsafe(self.func_handler._initialize(), self.loop)
 
+        # Initialize Adapter and Graph
+        self.tool_adapter = ToolAdapter(self.func_handler)
+        # Note: In a real async flow, we might need to wait for func_handler init
+        # But for now, we assume tools are registered after _initialize returns or we call it lazily.
+        # Actually, get_langchain_tools() reads from handler which reads from manager.
+
+    def _init_graph(self):
+        """Initialize the LangGraph agent with current tools"""
+        tools = []
+        if self.tool_adapter:
+            tools = self.tool_adapter.get_langchain_tools()
+        self.agent_graph = build_agent_graph(tools=tools)
+
     def change_system_prompt(self, prompt):
         self.prompt = prompt
         # 更新系统prompt至上下文
         self.dialogue.update_system_message(self.prompt)
 
     def chat(self, query, depth=0):
-        if query is not None:
-            self.logger.bind(tag=TAG).info(f"大模型收到用户消息: {query}")
+        """
+        New chat method using LangGraph.
+        This effectively replaces the manual loop with a graph execution.
+        """
+        # Ensure Graph is initialized
+        if self.agent_graph is None:
+            self._init_graph()
 
-        # 为最顶层时新建会话ID和发送FIRST请求
+        if query is not None:
+            self.logger.bind(tag=TAG).info(f"LangGraph收到用户消息: {query}")
+
+        # Start of turn
         if depth == 0:
             self.llm_finish_task = False
             self.sentence_id = str(uuid.uuid4().hex)
@@ -776,183 +807,83 @@ class ConnectionHandler:
                 )
             )
 
-        # 设置最大递归深度，避免无限循环，可根据实际需求调整
-        MAX_DEPTH = 5
-        force_final_answer = False  # 标记是否强制最终回答
+        # Retrieve User Profile from Store
+        # Since this is synchronous method called in a loop, we might need to handle async differently
+        # But 'chat' in original code was blocking? No, it calls self.llm.response which streams.
+        # Here we launch an async task to run the graph and stream output.
 
-        if depth >= MAX_DEPTH:
-            self.logger.bind(tag=TAG).debug(
-                f"已达到最大工具调用深度 {MAX_DEPTH}，将强制基于现有信息回答"
-            )
-            force_final_answer = True
-            # 添加系统指令，要求 LLM 基于现有信息回答
-            self.dialogue.put(
-                Message(
-                    role="user",
-                    content="[系统提示] 已达到最大工具调用次数限制，请你基于目前已经获取的所有信息，直接给出最终答案。不要再尝试调用任何工具。",
-                )
-            )
+        asyncio.run_coroutine_threadsafe(self._run_graph_and_stream(query), self.loop)
 
-        # Define intent functions
-        functions = None
-        # 达到最大深度时，禁用工具调用，强制 LLM 直接回答
-        if (
-            self.intent_type == "function_call"
-            and hasattr(self, "func_handler")
-            and not force_final_answer
-        ):
-            functions = self.func_handler.get_functions()
-        response_message = []
+        return True
 
+    async def _run_graph_and_stream(self, query):
+        """Async execution of the LangGraph with Streaming"""
         try:
-            # 使用带记忆的对话
-            memory_str = None
-            if self.memory is not None:
-                future = asyncio.run_coroutine_threadsafe(
-                    self.memory.query_memory(query), self.loop
-                )
-                memory_str = future.result()
+            inputs = {
+                "messages": [HumanMessage(content=query)],
+                "user_id": self.device_id or "anonymous",
+                "is_interrupted": False
+            }
 
-            if self.intent_type == "function_call" and functions is not None:
-                # 使用支持functions的streaming接口
-                llm_responses = self.llm.response_with_functions(
-                    self.session_id,
-                    self.dialogue.get_llm_dialogue_with_memory(
-                        memory_str, self.config.get("voiceprint", {})
-                    ),
-                    functions=functions,
-                )
-            else:
-                llm_responses = self.llm.response(
-                    self.session_id,
-                    self.dialogue.get_llm_dialogue_with_memory(
-                        memory_str, self.config.get("voiceprint", {})
-                    ),
-                )
+            # Fetch profile
+            store = get_store()
+            manager = SummaryManager(store)
+            profile = await manager.get_user_profile(inputs["user_id"])
+            if profile:
+                inputs["user_profile"] = profile
+
+            # Pass configuration (model name, tools)
+            # In a real scenario, we map self.config["LLM"] to the model name
+            llm_config = self.config.get("selected_module", {}).get("LLM", "")
+            model_name = "gpt-4o-mini" # Default
+            if llm_config and llm_config in self.config.get("LLM", {}):
+                 model_name = self.config["LLM"][llm_config].get("model_name", model_name)
+
+            config = {
+                "configurable": {
+                    "thread_id": self.session_id,
+                    "model_name": model_name,
+                    # We can pass tools if they are dynamic, but graph already has them bound during init
+                }
+            }
+
+            full_response_text = ""
+
+            # Use astream_events to capture token-by-token output
+            async for event in self.agent_graph.astream_events(inputs, config=config, version="v2"):
+                # Check for interruption
+                if self.client_abort or self.stop_event.is_set():
+                    self.logger.bind(tag=TAG).info("LangGraph execution interrupted.")
+                    break
+
+                kind = event["event"]
+
+                # Filter for Chat Model streaming events
+                if kind == "on_chat_model_stream":
+                    content = event["data"]["chunk"].content
+                    if content:
+                        # Stream chunk to TTS
+                        self.tts.tts_text_queue.put(
+                            TTSMessageDTO(
+                                sentence_id=self.sentence_id,
+                                sentence_type=SentenceType.MIDDLE,
+                                content_type=ContentType.TEXT,
+                                content_detail=content,
+                            )
+                        )
+                        full_response_text += content
+
+                # We can also handle "on_tool_start" or "on_tool_end" if we want to notify the user
+
+            # Update local dialogue state after completion
+            if full_response_text:
+                self.dialogue.put(Message(role="assistant", content=full_response_text))
+
         except Exception as e:
-            self.logger.bind(tag=TAG).error(f"LLM 处理出错 {query}: {e}")
-            return None
-
-        # 处理流式响应
-        tool_call_flag = False
-        # 支持多个并行工具调用 - 使用列表存储
-        tool_calls_list = []  # 格式: [{"id": "", "name": "", "arguments": ""}]
-        content_arguments = ""
-        self.client_abort = False
-        emotion_flag = True
-        for response in llm_responses:
-            if self.client_abort:
-                break
-            if self.intent_type == "function_call" and functions is not None:
-                content, tools_call = response
-                if "content" in response:
-                    content = response["content"]
-                    tools_call = None
-                if content is not None and len(content) > 0:
-                    content_arguments += content
-
-                if not tool_call_flag and content_arguments.startswith("<tool_call>"):
-                    # print("content_arguments", content_arguments)
-                    tool_call_flag = True
-
-                if tools_call is not None and len(tools_call) > 0:
-                    tool_call_flag = True
-                    self._merge_tool_calls(tool_calls_list, tools_call)
-            else:
-                content = response
-
-            # 在llm回复中获取情绪表情，一轮对话只在开头获取一次
-            if emotion_flag and content is not None and content.strip():
-                asyncio.run_coroutine_threadsafe(
-                    textUtils.get_emotion(self, content),
-                    self.loop,
-                )
-                emotion_flag = False
-
-            if content is not None and len(content) > 0:
-                if not tool_call_flag:
-                    response_message.append(content)
-                    self.tts.tts_text_queue.put(
-                        TTSMessageDTO(
-                            sentence_id=self.sentence_id,
-                            sentence_type=SentenceType.MIDDLE,
-                            content_type=ContentType.TEXT,
-                            content_detail=content,
-                        )
-                    )
-        # 处理function call
-        if tool_call_flag:
-            bHasError = False
-            # 处理基于文本的工具调用格式
-            if len(tool_calls_list) == 0 and content_arguments:
-                a = extract_json_from_string(content_arguments)
-                if a is not None:
-                    try:
-                        content_arguments_json = json.loads(a)
-                        tool_calls_list.append(
-                            {
-                                "id": str(uuid.uuid4().hex),
-                                "name": content_arguments_json["name"],
-                                "arguments": json.dumps(
-                                    content_arguments_json["arguments"],
-                                    ensure_ascii=False,
-                                ),
-                            }
-                        )
-                    except Exception as e:
-                        bHasError = True
-                        response_message.append(a)
-                else:
-                    bHasError = True
-                    response_message.append(content_arguments)
-                if bHasError:
-                    self.logger.bind(tag=TAG).error(
-                        f"function call error: {content_arguments}"
-                    )
-
-            if not bHasError and len(tool_calls_list) > 0:
-                # 如需要大模型先处理一轮，添加相关处理后的日志情况
-                if len(response_message) > 0:
-                    text_buff = "".join(response_message)
-                    self.tts_MessageText = text_buff
-                    self.dialogue.put(Message(role="assistant", content=text_buff))
-                response_message.clear()
-
-                self.logger.bind(tag=TAG).debug(
-                    f"检测到 {len(tool_calls_list)} 个工具调用"
-                )
-
-                # 收集所有工具调用的 Future
-                futures_with_data = []
-                for tool_call_data in tool_calls_list:
-                    self.logger.bind(tag=TAG).debug(
-                        f"function_name={tool_call_data['name']}, function_id={tool_call_data['id']}, function_arguments={tool_call_data['arguments']}"
-                    )
-
-                    future = asyncio.run_coroutine_threadsafe(
-                        self.func_handler.handle_llm_function_call(
-                            self, tool_call_data
-                        ),
-                        self.loop,
-                    )
-                    futures_with_data.append((future, tool_call_data))
-
-                # 等待协程结束（实际等待时长为最慢的那个）
-                tool_results = []
-                for future, tool_call_data in futures_with_data:
-                    result = future.result()
-                    tool_results.append((result, tool_call_data))
-
-                # 统一处理所有工具调用结果
-                if tool_results:
-                    self._handle_function_result(tool_results, depth=depth)
-
-        # 存储对话内容
-        if len(response_message) > 0:
-            text_buff = "".join(response_message)
-            self.tts_MessageText = text_buff
-            self.dialogue.put(Message(role="assistant", content=text_buff))
-        if depth == 0:
+            self.logger.bind(tag=TAG).error(f"LangGraph Execution Error: {e}")
+            traceback.print_exc()
+        finally:
+            # End of turn
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
                     sentence_id=self.sentence_id,
@@ -961,14 +892,6 @@ class ConnectionHandler:
                 )
             )
             self.llm_finish_task = True
-            # 使用lambda延迟计算，只有在DEBUG级别时才执行get_llm_dialogue()
-            self.logger.bind(tag=TAG).debug(
-                lambda: json.dumps(
-                    self.dialogue.get_llm_dialogue(), indent=4, ensure_ascii=False
-                )
-            )
-
-        return True
 
     def _handle_function_result(self, tool_results, depth):
         need_llm_tools = []
